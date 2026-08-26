@@ -145,6 +145,7 @@ class build_transformer(nn.Module):
         cls_sep_flag = getattr(cfg.MODEL, 'CLS_SEP', False)
         cls_gen_type = getattr(cfg.MODEL, 'CLS_GEN_TYPE', 'dynamic')
         cls_mlp_ratio = getattr(cfg.MODEL, 'CLS_MLP_RATIO', 4.0)  
+        use_rope_flag = getattr(cfg.MODEL, 'USE_ROPE', False)
         # ==========================================================
         self.base = factory[cfg.MODEL.TRANSFORMER_TYPE](img_size=cfg.INPUT.SIZE_TRAIN, sie_xishu=cfg.MODEL.SIE_COE,
                                                         camera=camera_num, view=view_num, stride_size=cfg.MODEL.STRIDE_SIZE, drop_path_rate=cfg.MODEL.DROP_PATH,
@@ -152,7 +153,8 @@ class build_transformer(nn.Module):
                                                         attn_drop_rate=cfg.MODEL.ATT_DROP_RATE,
                                                         cls_sep=cls_sep_flag,
                                                         cls_gen_type=cls_gen_type,
-                                                        cls_mlp_ratio=cls_mlp_ratio
+                                                        cls_mlp_ratio=cls_mlp_ratio,
+                                                        use_rope=use_rope_flag
                                                         )
         if cfg.MODEL.TRANSFORMER_TYPE == 'deit_small_patch16_224_TransReID':
             self.in_planes = 384
@@ -247,13 +249,15 @@ class build_transformer_local(nn.Module):
         cls_sep_flag = getattr(cfg.MODEL, 'CLS_SEP', False)
         cls_gen_type = getattr(cfg.MODEL, 'CLS_GEN_TYPE', 'dynamic')
         cls_mlp_ratio = getattr(cfg.MODEL, 'CLS_MLP_RATIO', 4.0)
+        use_rope_flag = getattr(cfg.MODEL, 'USE_ROPE', False)
         # ==========================================================
         
         self.base = factory[cfg.MODEL.TRANSFORMER_TYPE](img_size=cfg.INPUT.SIZE_TRAIN, sie_xishu=cfg.MODEL.SIE_COE, local_feature=cfg.MODEL.JPM, 
                                                         camera=camera_num, view=view_num, stride_size=cfg.MODEL.STRIDE_SIZE, drop_path_rate=cfg.MODEL.DROP_PATH,
                                                         cls_sep=cls_sep_flag,
                                                         cls_gen_type=cls_gen_type,
-                                                        cls_mlp_ratio=cls_mlp_ratio
+                                                        cls_mlp_ratio=cls_mlp_ratio,
+                                                        use_rope=use_rope_flag
                                                         )
 
         # === 新增：为局部分支设立“共享聚合 MLP” ===
@@ -345,12 +349,15 @@ class build_transformer_local(nn.Module):
 
     def forward(self, x, label=None, cam_label= None, view_label=None):  # label is unused if self.cos_layer == 'no'
         # ===============================================
+        r_cos = getattr(self.base, 'rope_cos', None)
+        r_sin = getattr(self.base, 'rope_sin', None)
+
         if getattr(self, 'cls_sep', False):
             # 解包主干传来的 3 个组件
             features, cls_outputs_11, query_12_norm = self.base(x, cam_label=cam_label, view_label=view_label)
             
             # 1. 全局分支
-            b1_feat = self.b1(features)  # 执行第 12 层, 输出 [B, 196, 768]
+            b1_feat = self.b1(features, r_cos, r_sin)  # 执行第 12 层, 输出 [B, 196, 768]
             b1_feat_norm = self.base.cross_norm_x_list[-1](b1_feat)
             # 使用 query_12 收集全局特征
             attn_g = (query_12_norm @ b1_feat_norm.transpose(-2, -1)) * self.scale   # [B, 1, C] @ [B, C, N] -> [B, 1, N] = [B, 1, 196]
@@ -361,8 +368,19 @@ class build_transformer_local(nn.Module):
             global_feat = self.base.cls_aggregator(global_stacked).squeeze(-1)  # [B, 768]
 
             # 2. JPM 局部分支
+            if r_cos is not None:
+                # 增加 batch 维度以适应 shuffle_unit 
+                r_cos_shuf = r_cos.unsqueeze(0) # 变成 [1, N, C]
+                r_sin_shuf = r_sin.unsqueeze(0)
+            else:
+                r_cos_shuf, r_sin_shuf = None, None
+                
             if self.rearrange:
                 x_local = shuffle_unit(features, self.shift_num, self.shuffle_groups, begin=0)
+                if r_cos is not None:
+                    # 使用与 features 完全一致的参数打乱坐标！
+                    r_cos_shuf = shuffle_unit(r_cos_shuf, self.shift_num, self.shuffle_groups, begin=0)
+                    r_sin_shuf = shuffle_unit(r_sin_shuf, self.shift_num, self.shuffle_groups, begin=0)
             else:
                 x_local = features
             
@@ -370,8 +388,15 @@ class build_transformer_local(nn.Module):
             local_feats = []
             
             for i in range(4):
+                if r_cos is not None:
+                    # 提取对应区间的打乱后的坐标
+                    rc_i = r_cos_shuf[0, i*patch_length : (i+1)*patch_length]
+                    rs_i = r_sin_shuf[0, i*patch_length : (i+1)*patch_length]
+                else:
+                    rc_i, rs_i = None, None
+
                 # 切片并执行第 12 层
-                b2_feat = self.b2(x_local[:, i*patch_length : (i+1)*patch_length])
+                b2_feat = self.b2(x_local[:, i*patch_length : (i+1)*patch_length], rc_i, rs_i)
                 b2_feat_norm = self.local_cross_norm_x(b2_feat)
                 
                 # 使用相同的 query_12 收集局部组特征
@@ -390,37 +415,74 @@ class build_transformer_local(nn.Module):
             # 原版 JPM 逻辑 (保持不变)
             features = self.base(x, cam_label=cam_label, view_label=view_label)
 
+            # =========为带有 cls_token 的分支补齐 0 旋转 ================
+            if r_cos is not None:
+                r_cos_f = torch.cat([torch.ones(1, r_cos.shape[-1], device=x.device), r_cos], dim=0)
+                r_sin_f = torch.cat([torch.zeros(1, r_sin.shape[-1], device=x.device), r_sin], dim=0)
+            else:
+                r_cos_f, r_sin_f = None, None
+            # ===========================================================
+
             # global branch
-            b1_feat = self.b1(features) 
+            b1_feat = self.b1(features, r_cos_f, r_sin_f) 
             global_feat = b1_feat[:, 0]
 
             feature_length = features.size(1) - 1
             patch_length = feature_length // self.divide_length
             token = features[:, 0:1]
 
+            if r_cos is not None:
+                r_cos_shuf = r_cos.unsqueeze(0)
+                r_sin_shuf = r_sin.unsqueeze(0)
+            else:
+                r_cos_shuf, r_sin_shuf = None, None
+
             if self.rearrange:
-                x = shuffle_unit(features, self.shift_num, self.shuffle_groups) # 默认 begin=1
+                x = shuffle_unit(features, self.shift_num, self.shuffle_groups)  # 默认 begin=1
+                if r_cos is not None:
+                    r_cos_shuf = shuffle_unit(r_cos_shuf, self.shift_num, self.shuffle_groups, begin=0)
+                    r_sin_shuf = shuffle_unit(r_sin_shuf, self.shift_num, self.shuffle_groups, begin=0)
             else:
                 x = features[:, 1:]
             
             # lf_1
             b1_local_feat = x[:, :patch_length]
-            b1_local_feat = self.b2(torch.cat((token, b1_local_feat), dim=1))
+            if r_cos is not None:
+                rc_1 = torch.cat([r_cos_f[0:1], r_cos_shuf[0, :patch_length]], dim=0)
+                rs_1 = torch.cat([r_sin_f[0:1], r_sin_shuf[0, :patch_length]], dim=0)
+            else:
+                rc_1, rs_1 = None, None
+            b1_local_feat = self.b2(torch.cat((token, b1_local_feat), dim=1), rc_1, rs_1)
             local_feat_1 = b1_local_feat[:, 0]
 
             # lf_2
             b2_local_feat = x[:, patch_length:patch_length*2]
-            b2_local_feat = self.b2(torch.cat((token, b2_local_feat), dim=1))
+            if r_cos is not None:
+                rc_2 = torch.cat([r_cos_f[0:1], r_cos_shuf[0, patch_length:patch_length*2]], dim=0)
+                rs_2 = torch.cat([r_sin_f[0:1], r_sin_shuf[0, patch_length:patch_length*2]], dim=0)
+            else:
+                rc_2, rs_2 = None, None
+            b2_local_feat = self.b2(torch.cat((token, b2_local_feat), dim=1), rc_2, rs_2)
             local_feat_2 = b2_local_feat[:, 0]
 
             # lf_3
             b3_local_feat = x[:, patch_length*2:patch_length*3]
-            b3_local_feat = self.b2(torch.cat((token, b3_local_feat), dim=1))
+            if r_cos is not None:
+                rc_3 = torch.cat([r_cos_f[0:1], r_cos_shuf[0, patch_length*2:patch_length*3]], dim=0)
+                rs_3 = torch.cat([r_sin_f[0:1], r_sin_shuf[0, patch_length*2:patch_length*3]], dim=0)
+            else:
+                rc_3, rs_3 = None, None
+            b3_local_feat = self.b2(torch.cat((token, b3_local_feat), dim=1), rc_3, rs_3)
             local_feat_3 = b3_local_feat[:, 0]
 
             # lf_4
             b4_local_feat = x[:, patch_length*3:patch_length*4]
-            b4_local_feat = self.b2(torch.cat((token, b4_local_feat), dim=1))
+            if r_cos is not None:
+                rc_4 = torch.cat([r_cos_f[0:1], r_cos_shuf[0, patch_length*3:patch_length*4]], dim=0)
+                rs_4 = torch.cat([r_sin_f[0:1], r_sin_shuf[0, patch_length*3:patch_length*4]], dim=0)
+            else:
+                rc_4, rs_4 = None, None
+            b4_local_feat = self.b2(torch.cat((token, b4_local_feat), dim=1), rc_4, rs_4)
             local_feat_4 = b4_local_feat[:, 0]
         # ==============================================================
 

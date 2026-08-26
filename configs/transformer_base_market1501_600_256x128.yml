@@ -11,7 +11,7 @@ MODEL:
   STRIDE_SIZE: [16, 16]
   # ======= 新增 =========
   CLS_SEP: False
-  CLS_GEN_TYPE: 'dynamic'
+  CLS_GEN_TYPE: 'dynamic'   # 'static' or 'dynamic'
   CLS_MLP_RATIO: 4.0
   USE_ROPE: True   # 控制是否使用 2D RoPE
   # ======================

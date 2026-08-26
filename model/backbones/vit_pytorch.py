@@ -23,6 +23,7 @@ Hacked together by / Copyright 2020 Ross Wightman
 import math
 from functools import partial
 from itertools import repeat
+from utils.rope_2d import generate_2d_rope, apply_rotary_pos_emb
 
 import torch
 import torch.nn as nn
@@ -138,8 +139,9 @@ class Mlp(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0., use_rope=False):
         super().__init__()
+        self.use_rope = use_rope
         self.num_heads = num_heads
         head_dim = dim // num_heads
         # NOTE scale factor was wrong in my original version, can set manually to be compat with prev weights
@@ -150,11 +152,18 @@ class Attention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x):
+    def forward(self, x, rope_cos=None, rope_sin=None):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]   # make torchscript happy (cannot use tensor as tuple)
 
+        # ======= 增加 2D RoPE ==========
+        if self.use_rope and rope_cos is not None and rope_sin is not None:
+            if rope_cos.shape[0] == N: # 确保长度匹配
+                q = apply_rotary_pos_emb(q, rope_cos, rope_sin)
+                k = apply_rotary_pos_emb(k, rope_cos, rope_sin)
+        # ===============================
+                
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
@@ -166,21 +175,20 @@ class Attention(nn.Module):
 
 
 class Block(nn.Module):
-
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
-                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, use_rope=False):
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.attn = Attention(
-            dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
+            dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop, use_rope=use_rope)
         # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
-    def forward(self, x):
-        x = x + self.drop_path(self.attn(self.norm1(x)))
+    def forward(self, x, rope_cos=None, rope_sin=None):
+        x = x + self.drop_path(self.attn(self.norm1(x), rope_cos, rope_sin))   # 传入 2D RoPE
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
 
@@ -295,8 +303,9 @@ class TransReID(nn.Module):
     def __init__(self, img_size=224, patch_size=16, stride_size=16, in_chans=3, num_classes=1000, embed_dim=768, depth=12,
                  num_heads=12, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0., camera=0, view=0,
                  drop_path_rate=0., hybrid_backbone=None, norm_layer=nn.LayerNorm, local_feature=False, sie_xishu =1.0,
-                 cls_sep=False, cls_gen_type='dynamic', cls_mlp_ratio=4.0):
+                 cls_sep=False, cls_gen_type='dynamic', cls_mlp_ratio=4.0, use_rope=False):
         super().__init__()
+        self.use_rope = use_rope
         self.num_classes = num_classes
         self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
         self.local_feature = local_feature
@@ -311,6 +320,13 @@ class TransReID(nn.Module):
         num_patches = self.patch_embed.num_patches
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        # ========== 预计算 2D RoPE ======================
+        if self.use_rope:
+            h_p, w_p = self.patch_embed.num_y, self.patch_embed.num_x
+            cos, sin = generate_2d_rope(h_p, w_p, embed_dim // num_heads)
+            self.register_buffer('rope_cos', cos)
+            self.register_buffer('rope_sin', sin)
+        # ===============================================
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
         self.cam_num = camera
         self.view_num = view
@@ -342,7 +358,7 @@ class TransReID(nn.Module):
         self.blocks = nn.ModuleList([
             Block(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
-                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer)
+                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, use_rope=use_rope)
             for i in range(depth)])
 
         self.norm = norm_layer(embed_dim)
@@ -412,6 +428,10 @@ class TransReID(nn.Module):
         x = self.patch_embed(x) # [B, C, H, W] -> [B, N, C]=[B, 196, 768]
         # 现在 x 中还没有 cls_token
 
+        # 提取预先算好的 RoPE
+        rope_cos = getattr(self, 'rope_cos', None)
+        rope_sin = getattr(self, 'rope_sin', None)
+
         # ================== 【新逻辑：CLS 解耦分离流】 ==================
         if getattr(self, 'cls_sep', False):
             # 取出 pos_embed 中属于 patch 的部分（去掉第 0 个旧 cls 的位置编码）
@@ -446,7 +466,7 @@ class TransReID(nn.Module):
             
             # 2. 逐层空间交互 + 手撕无参 Cross-Attention
             for i, blk in enumerate(loop_blocks):
-                x = blk(x)   # Patch 内部完成一层的 Self-Attention + FFN
+                x = blk(x, rope_cos, rope_sin)   # Patch 内部完成一层的 Self-Attention + FFN
                 cls_i = cls_queries_norm[:, i:i+1, :]   # 取出当层的小队长 cls_i: [B, 1, C]
                 x_cross_norm = self.cross_norm_x_list[i](x)
                 # --- 向当层 Patch 索取信息 (Cross-Attention) ---
@@ -486,14 +506,20 @@ class TransReID(nn.Module):
                 x = x + self.pos_embed
 
             x = self.pos_drop(x)
-
+            # ===因为原版 x 第 0 维是 cls_token，它不进行旋转 (cos=1, sin=0)===
+            if rope_cos is not None and rope_sin is not None:
+                rope_cos_with_cls = torch.cat([torch.ones(1, rope_cos.shape[-1], device=x.device), rope_cos], dim=0)
+                rope_sin_with_cls = torch.cat([torch.zeros(1, rope_sin.shape[-1], device=x.device), rope_sin], dim=0)
+            else:
+                rope_cos_with_cls, rope_sin_with_cls = None, None
+            # ==================================================
             if self.local_feature:
                 for blk in self.blocks[:-1]:
-                    x = blk(x)
+                    x = blk(x, rope_cos_with_cls, rope_sin_with_cls)
                 return x
             else:
                 for blk in self.blocks:
-                    x = blk(x)
+                    x = blk(x, rope_cos_with_cls, rope_sin_with_cls)
                 x = self.norm(x)
                 return x[:, 0]   # 只返回 cls token
 
