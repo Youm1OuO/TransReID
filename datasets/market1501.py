@@ -70,11 +70,34 @@ class Market1501(BaseImageDataset):
             pid, _ = map(int, pattern.search(img_path).groups())
             if pid == -1: continue  # junk images are just ignored
             pid_container.add(pid)
+            
+        # =================【开始修改 1：筛选 ID】=================
+        # 如果是训练集 (relabel=True)，我们进行筛选
+        if relabel:
+            # 1. 将所有 ID 排序
+            sorted_pids = sorted(list(pid_container))
+            
+            # 2. 截取前 600 人 (如果您想去掉最后150人，也可以写 [:-150])
+            # 注意：Market1501 训练集原始大概有 751 人
+            valid_pids = sorted_pids[:600]  
+            
+            # 3. 更新 pid_container, 只保留这 600 人
+            pid_container = set(valid_pids)
+            print(f"User Customization: Only keeping first {len(pid_container)} identities for training!")
+        # =================【修改 1 结束】=================
+        
         pid2label = {pid: label for label, pid in enumerate(pid_container)}
         dataset = []
         for img_path in sorted(img_paths):
             pid, camid = map(int, pattern.search(img_path).groups())
             if pid == -1: continue  # junk images are just ignored
+            
+            # =================【开始修改 2：跳过被剔除的图片】=================
+            # 这一步非常重要！如果不加, 下面查字典(pid2label)时会报错
+            if relabel and pid not in pid_container:
+                continue
+            # =================【修改 2 结束】=================
+            
             assert 0 <= pid <= 1501  # pid == 0 means background
             assert 1 <= camid <= 6
             camid -= 1  # index starts from 0

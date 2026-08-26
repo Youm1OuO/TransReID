@@ -391,6 +391,13 @@ __factory_T_type = {
 }
 
 def make_model(cfg, num_class, camera_num, view_num):
+    '''
+    参数：
+        cfg: 配置文件
+        num_class: 类别数
+        camera_num: 相机数
+        view_num: 视角数
+    '''
     if cfg.MODEL.NAME == 'transformer':
         if cfg.MODEL.JPM:
             model = build_transformer_local(num_class, camera_num, view_num, cfg, __factory_T_type, rearrange=cfg.MODEL.RE_ARRANGE)

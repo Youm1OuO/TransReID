@@ -38,6 +38,28 @@ class MSMT17(BaseImageDataset):
         train = self._process_dir(self.train_dir, self.list_train_path)
         val = self._process_dir(self.train_dir, self.list_val_path)
         train += val
+        
+        # ==============================================================
+        # 【修改开始】: 为 De-ReID 预训练筛选前 900 个 ID
+        # ==============================================================
+        # 获取当前加载的所有 PID (train列表里 item[1] 是 pid)
+        all_pids = sorted(list(set([item[1] for item in train])))
+        
+        # 如果 ID 数量超过 900, 则进行截断
+        if len(all_pids) > 900:
+            target_pids = set(all_pids[:900])  # 取前 900 个 ID
+            
+            # 重新过滤 train 列表，只保留这 900 人的图片
+            train = [item for item in train if item[1] in target_pids]
+            
+            if verbose:
+                print(f"\n[MSMT17 De-ReID] Filter Applied: Keeping first 900 identities.")
+                print(f"[MSMT17 De-ReID] Original IDs: {len(all_pids)} -> New IDs: {len(target_pids)}")
+                print(f"[MSMT17 De-ReID] Total Train Images: {len(train)}\n")
+        # ==============================================================
+        # 【修改结束】
+        # ==============================================================
+          
         query = self._process_dir(self.test_dir, self.list_query_path)
         gallery = self._process_dir(self.test_dir, self.list_gallery_path)
         if verbose:

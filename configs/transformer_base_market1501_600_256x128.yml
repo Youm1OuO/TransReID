@@ -1,0 +1,80 @@
+MODEL:
+  PRETRAIN_CHOICE: 'imagenet'
+  PRETRAIN_PATH: '/home/muyou/Pretrained_model/ImageNet/ViT-Base/jx_vit_base_p16_224-80ecf9dd.pth'
+  METRIC_LOSS_TYPE: 'triplet'
+  IF_LABELSMOOTH: 'off'
+  IF_WITH_CENTER: 'no'
+  NAME: 'transformer'
+  NO_MARGIN: True
+  DEVICE_ID: ('0')
+  TRANSFORMER_TYPE: 'vit_base_patch16_224_TransReID'
+  STRIDE_SIZE: [16, 16]
+
+INPUT:
+  SIZE_TRAIN: [256, 128]
+  SIZE_TEST: [256, 128]
+  PROB: 0.5 # random horizontal flip
+  RE_PROB: 0.5 # random erasing
+  PADDING: 10
+  PIXEL_MEAN: [0.5, 0.5, 0.5]
+  PIXEL_STD: [0.5, 0.5, 0.5]
+
+DATASETS:
+  NAMES: ('market1501')
+  ROOT_DIR: ('/home/muyou/Dataset')
+
+DATALOADER:
+  SAMPLER: 'softmax_triplet'
+  NUM_INSTANCE: 4
+  NUM_WORKERS: 8
+
+SOLVER:
+  OPTIMIZER_NAME: 'SGD'
+  MAX_EPOCHS: 120
+  BASE_LR: 0.008
+  IMS_PER_BATCH: 64
+  WARMUP_METHOD: 'linear'
+  LARGE_FC_LR: False
+  CHECKPOINT_PERIOD: 120
+  LOG_PERIOD: 50
+  EVAL_PERIOD: 120
+  WEIGHT_DECAY:  1e-4
+  WEIGHT_DECAY_BIAS: 1e-4
+  BIAS_LR_FACTOR: 2
+
+TEST:
+  EVAL: True
+  IMS_PER_BATCH: 256
+  RE_RANKING: False
+  WEIGHT: ''
+  NECK_FEAT: 'before'
+  FEAT_NORM: 'yes'
+
+OUTPUT_DIR: './logs/market_pretrain_600_256x128'
+
+
+# 训练指令
+# python train.py --config_file configs/transformer_base_market1501_600_256x128.yml
+
+
+# 该模型对应的是原论文的 Table 6 中 ViT-B/16 这一栏下的 "Baseline" (第一行)
+# 只不过我们只用了前面 600 个 PID 来训练 (所以准确率可能会比论文中的低一点)
+
+
+# 无滑动窗口 (No *): 
+#    我们着 STRIDE_SIZE: [16, 16] 
+#    而 ViT 的 Patch Size 是 16，, 这意味着你的步长等于 Patch 大小，即非重叠切片
+#    论文中带 * 的模型使用了重叠切片（Stride 12）
+# 
+# 无摄像机信息嵌入 (No ©): 
+#    你的日志显示 SIE_CAMERA: false 和 SIE_VIEW: false
+#    这意味着没有使用论文核心贡献之一的 SIE 模块
+#
+# 无拼图模块 (No JPM): 
+#    default.py 中默认 JPM: false
+#    这意味着没有使用 Jigsaw Patch Module
+#
+# 结论： 
+#    这意味着既没有开启 SIE (©)
+#    也没有开启 JPM, 也没有使用重叠切片 (*)
+#    因此，这个模型完全等同于论文中 ViT-B/16 下的 Baseline 行

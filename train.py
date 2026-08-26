@@ -13,6 +13,7 @@ import argparse
 # from timm.scheduler import create_scheduler
 from config import cfg
 
+
 def set_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)

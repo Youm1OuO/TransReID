@@ -1,0 +1,54 @@
+15:21 2025/12/11
+	修改 market1501.py 文件 (只添加, 没删除)
+	
+	74 ~ 87
+	# =================【开始修改 1：筛选 ID】=================
+	# 如果是训练集 (relabel=True)，我们进行筛选
+	if relabel:
+		# 1. 将所有 ID 排序
+		sorted_pids = sorted(list(pid_container))
+		
+		# 2. 截取前 600 人 (如果您想去掉最后150人，也可以写 [:-150])
+		# 注意：Market1501 训练集原始大概有 751 人
+		valid_pids = sorted_pids[:600]  
+		
+		# 3. 更新 pid_container, 只保留这 600 人
+		pid_container = set(valid_pids)
+		print(f"User Customization: Only keeping first {len(pid_container)} identities for training!")
+	# =================【修改 1 结束】=================
+
+	95 ~ 99
+	# =================【开始修改 2：跳过被剔除的图片】=================
+	# 这一步非常重要！如果不加, 下面查字典(pid2label)时会报错
+	if relabel and pid not in pid_container:
+		continue
+	# =================【修改 2 结束】=================
+
+
+
+
+14:47 2025/12/16
+	修改 msmt17.py 文件 (只添加, 没删除)
+	
+	42 ~ 61
+		# ==============================================================
+        # 【修改开始】: 为 De-ReID 预训练筛选前 900 个 ID
+        # ==============================================================
+        # 获取当前加载的所有 PID (train列表里 item[1] 是 pid)
+        all_pids = sorted(list(set([item[1] for item in train])))
+        
+        # 如果 ID 数量超过 900，则进行截断
+        if len(all_pids) > 900:
+            target_pids = set(all_pids[:900]) # 取前 900 个 ID
+            
+            # 重新过滤 train 列表，只保留这 900 人的图片
+            train = [item for item in train if item[1] in target_pids]
+            
+            if verbose:
+                print(f"\n[MSMT17 De-ReID] Filter Applied: Keeping first 900 identities.")
+                print(f"[MSMT17 De-ReID] Original IDs: {len(all_pids)} -> New IDs: {len(target_pids)}")
+                print(f"[MSMT17 De-ReID] Total Train Images: {len(train)}\n")
+        # ==============================================================
+        # 【修改结束】
+        # ==============================================================
+
