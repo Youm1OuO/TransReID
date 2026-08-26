@@ -67,6 +67,9 @@ _C.MODEL.RE_ARRANGE = True
 _C.MODEL.SIE_COE = 3.0
 _C.MODEL.SIE_CAMERA = False
 _C.MODEL.SIE_VIEW = False
+_C.MODEL.CLS_SEP = False
+_C.MODEL.CLS_GEN_TYPE = 'dynamic'
+_C.MODEL.CLS_MLP_RATIO = 4.0
 
 # -----------------------------------------------------------------------------
 # INPUT

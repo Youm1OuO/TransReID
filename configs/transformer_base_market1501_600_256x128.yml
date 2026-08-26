@@ -9,6 +9,11 @@ MODEL:
   DEVICE_ID: ('0')
   TRANSFORMER_TYPE: 'vit_base_patch16_224_TransReID'
   STRIDE_SIZE: [16, 16]
+  # ======= 新增 =========
+  CLS_SEP: False
+  CLS_GEN_TYPE: 'dynamic'
+  CLS_MLP_RATIO: 4.0
+  # ======================
 
 INPUT:
   SIZE_TRAIN: [256, 128]

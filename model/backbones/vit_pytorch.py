@@ -250,8 +250,7 @@ class HybridEmbed(nn.Module):
 
 
 class PatchEmbed_overlap(nn.Module):
-    """ Image to Patch Embedding with overlapping patches
-    """
+    """ Image to Patch Embedding with overlapping patches"""
     def __init__(self, img_size=224, patch_size=16, stride_size=20, in_chans=3, embed_dim=768):
         super().__init__()
         img_size = to_2tuple(img_size)
@@ -284,8 +283,10 @@ class PatchEmbed_overlap(nn.Module):
         assert H == self.img_size[0] and W == self.img_size[1], \
             f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
         x = self.proj(x)
-
-        x = x.flatten(2).transpose(1, 2) # [64, 8, 768]
+        # 输入 x : [B, 3, H, W], 输出 x : [B, 768, 224/16, 224/16]=[B, 768, 14, 14]
+        x = x.flatten(2).transpose(1, 2)
+        # x.flatten(2): [B, 768, 14*14]=[B, 768, 196]
+        # 最后 x : [B, 196, 768]
         return x
 
 
@@ -294,7 +295,8 @@ class TransReID(nn.Module):
     """
     def __init__(self, img_size=224, patch_size=16, stride_size=16, in_chans=3, num_classes=1000, embed_dim=768, depth=12,
                  num_heads=12, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0., camera=0, view=0,
-                 drop_path_rate=0., hybrid_backbone=None, norm_layer=nn.LayerNorm, local_feature=False, sie_xishu =1.0):
+                 drop_path_rate=0., hybrid_backbone=None, norm_layer=nn.LayerNorm, local_feature=False, sie_xishu =1.0,
+                 cls_sep=False, cls_gen_type='dynamic', cls_mlp_ratio=4.0):
         super().__init__()
         self.num_classes = num_classes
         self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
@@ -352,6 +354,33 @@ class TransReID(nn.Module):
         trunc_normal_(self.pos_embed, std=.02)
 
         self.apply(self._init_weights)
+        # ================== 【新增：CLS 解耦分离模块】 ==================
+        self.cls_sep = cls_sep
+        self.cls_gen_type = cls_gen_type
+        
+        if self.cls_sep:
+            # 1. 初始小队长生成器
+            if self.cls_gen_type == 'static':
+                self.cls_queries = nn.Parameter(torch.randn(1, depth, embed_dim))   # 即 [1, 12, 768]
+            elif self.cls_gen_type == 'dynamic':
+                # 直接复用上面现成的 Mlp 类
+                self.cls_generator = Mlp(
+                    in_features=num_patches, 
+                    hidden_features=int(num_patches * cls_mlp_ratio),
+                    out_features=depth
+                )
+                # 输入：[B, N, C], 输出：[B, depth, C]
+            
+            # 2. 最终的聚合器
+            self.cls_aggregator = Mlp(
+                in_features=depth, 
+                hidden_features=int(depth * cls_mlp_ratio),
+                out_features=1
+            )
+            # 输入：[B, 12, C], 输出：[B, 1, C]
+            
+            print(f"====> Enabled CLS Separation! Generator type: {self.cls_gen_type} <====")
+        # ====================================================================
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -374,35 +403,88 @@ class TransReID(nn.Module):
         self.fc = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
     def forward_features(self, x, camera_id, view_id):
+        '''x: [B, C, H, W]'''
         B = x.shape[0]
-        x = self.patch_embed(x)
+        x = self.patch_embed(x) # [B, C, H, W] -> [B, N, C]=[B, 196, 768]
+        # 现在 x 中还没有 cls_token
 
-        cls_tokens = self.cls_token.expand(B, -1, -1)  # stole cls_tokens impl from Phil Wang, thanks
-        x = torch.cat((cls_tokens, x), dim=1)
+        # ================== 【新逻辑：CLS 解耦分离流】 ==================
+        if getattr(self, 'cls_sep', False):
+            if self.local_feature:
+                raise NotImplementedError("目前 CLS 分离 (cls_sep=True) 不支持与 JPM 模块 (local_feature=True) 同时使用！请在 cfg 中设置 JPM: False")
 
-        if self.cam_num > 0 and self.view_num > 0:
-            x = x + self.pos_embed + self.sie_xishu * self.sie_embed[camera_id * self.view_num + view_id]
-        elif self.cam_num > 0:
-            x = x + self.pos_embed + self.sie_xishu * self.sie_embed[camera_id]
-        elif self.view_num > 0:
-            x = x + self.pos_embed + self.sie_xishu * self.sie_embed[view_id]
-        else:
-            x = x + self.pos_embed
+            # 取出 pos_embed 中属于 patch 的部分（去掉第 0 个旧 cls 的位置编码）
+            patch_pos_embed = self.pos_embed[:, 1:, :] 
+            
+            if self.cam_num > 0 and self.view_num > 0:
+                x = x + patch_pos_embed + self.sie_xishu * self.sie_embed[camera_id * self.view_num + view_id]
+            elif self.cam_num > 0:
+                x = x + patch_pos_embed + self.sie_xishu * self.sie_embed[camera_id]
+            elif self.view_num > 0:
+                x = x + patch_pos_embed + self.sie_xishu * self.sie_embed[view_id]
+            else:
+                x = x + patch_pos_embed
 
-        x = self.pos_drop(x)
+            x = self.pos_drop(x)
 
-        if self.local_feature:
-            for blk in self.blocks[:-1]:
-                x = blk(x)
-            return x
+            # 1. 获取 12 层的初始小队长 (完美运用 Transpose 降低参数量)
+            if self.cls_gen_type == 'static':
+                cls_queries = self.cls_queries.expand(B, -1, -1) 
+            elif self.cls_gen_type == 'dynamic':
+                x_trans = x.transpose(1, 2)   # [B, N, C] -> [B, C, N]
+                cls_queries = self.cls_generator(x_trans)   # Mlp(N -> depth): [B, C, N] -> [B, C, depth]
+                cls_queries = cls_queries.transpose(1, 2)   # [B, C, depth] -> [B, depth, C]
 
-        else:
-            for blk in self.blocks:
-                x = blk(x)
+            cls_outputs = []
+            scale = self.embed_dim ** -0.5     # 无参交叉注意力的缩放因子
 
+            # 2. 逐层空间交互 + 手撕无参 Cross-Attention
+            for i, blk in enumerate(self.blocks):
+                x = blk(x)   # Patch 内部完成一层的 Self-Attention + FFN
+                
+                cls_i = cls_queries[:, i:i+1, :]   # 取出当层的小队长 cls_i: [B, 1, C]
+                # --- 向当层 Patch 索取信息 (Cross-Attention) ---
+                attn = (cls_i @ x.transpose(-2, -1)) * scale   # [B, 1, C] @ [B, C, N] -> [B, 1, N]
+                attn = attn.softmax(dim=-1)
+                updated_cls_i = attn @ x                       # [B, 1, N] @ [B, N, C] -> [B, 1, C]
+                # ---------------------------------------------
+                cls_outputs.append(updated_cls_i.squeeze(1))   # 存入列表, 形状为 [B, C]
+            
             x = self.norm(x)
 
-            return x[:, 0]
+            # 3. 聚合小队长信息, 作为 global_feat 传给后续计算 Loss
+            stacked_cls = torch.stack(cls_outputs, dim=1)         # 堆叠 12 层: [B, depth, C]
+            stacked_cls_trans = stacked_cls.transpose(1, 2)       # [B, depth, C] -> [B, C, depth]
+            global_feat = self.cls_aggregator(stacked_cls_trans)  # Mlp(depth -> 1): [B, C, depth] -> [B, C, 1]
+            global_feat = global_feat.squeeze(-1)                 # [B, C, 1] -> [B, C]
+            
+            return global_feat
+
+        # 原版逻辑 (兼容旧版)
+        else:
+            cls_tokens = self.cls_token.expand(B, -1, -1)  
+            x = torch.cat((cls_tokens, x), dim=1)
+
+            if self.cam_num > 0 and self.view_num > 0:
+                x = x + self.pos_embed + self.sie_xishu * self.sie_embed[camera_id * self.view_num + view_id]
+            elif self.cam_num > 0:
+                x = x + self.pos_embed + self.sie_xishu * self.sie_embed[camera_id]
+            elif self.view_num > 0:
+                x = x + self.pos_embed + self.sie_xishu * self.sie_embed[view_id]
+            else:
+                x = x + self.pos_embed
+
+            x = self.pos_drop(x)
+
+            if self.local_feature:
+                for blk in self.blocks[:-1]:
+                    x = blk(x)
+                return x
+            else:
+                for blk in self.blocks:
+                    x = blk(x)
+                x = self.norm(x)
+                return x[:, 0]   # 只返回 cls token
 
     def forward(self, x, cam_label=None, view_label=None):
         x = self.forward_features(x, cam_label, view_label)
@@ -451,11 +533,13 @@ def resize_pos_embed(posemb, posemb_new, hight, width):
     return posemb
 
 
-def vit_base_patch16_224_TransReID(img_size=(256, 128), stride_size=16, drop_rate=0.0, attn_drop_rate=0.0, drop_path_rate=0.1, camera=0, view=0,local_feature=False,sie_xishu=1.5, **kwargs):
+def vit_base_patch16_224_TransReID(img_size=(256, 128), stride_size=16, drop_rate=0.0, attn_drop_rate=0.0, drop_path_rate=0.1, camera=0, view=0,local_feature=False,sie_xishu=1.5, 
+                                   cls_sep=False, cls_gen_type='dynamic', cls_mlp_ratio=4.0, **kwargs):
     model = TransReID(
         img_size=img_size, patch_size=16, stride_size=stride_size, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=True,\
         camera=camera, view=view, drop_path_rate=drop_path_rate, drop_rate=drop_rate, attn_drop_rate=attn_drop_rate,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6),  sie_xishu=sie_xishu, local_feature=local_feature, **kwargs)
+        norm_layer=partial(nn.LayerNorm, eps=1e-6), sie_xishu=sie_xishu, local_feature=local_feature, 
+        cls_sep=cls_sep, cls_gen_type=cls_gen_type, cls_mlp_ratio=cls_mlp_ratio, **kwargs)
 
     return model
 

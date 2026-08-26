@@ -141,10 +141,19 @@ class build_transformer(nn.Module):
         else:
             view_num = 0
 
+        # ================== 【新增：安全获取配置】 ==================
+        cls_sep_flag = getattr(cfg.MODEL, 'CLS_SEP', False)
+        cls_gen_type = getattr(cfg.MODEL, 'CLS_GEN_TYPE', 'dynamic')
+        cls_mlp_ratio = getattr(cfg.MODEL, 'CLS_MLP_RATIO', 4.0)  
+        # ==========================================================
         self.base = factory[cfg.MODEL.TRANSFORMER_TYPE](img_size=cfg.INPUT.SIZE_TRAIN, sie_xishu=cfg.MODEL.SIE_COE,
                                                         camera=camera_num, view=view_num, stride_size=cfg.MODEL.STRIDE_SIZE, drop_path_rate=cfg.MODEL.DROP_PATH,
                                                         drop_rate= cfg.MODEL.DROP_OUT,
-                                                        attn_drop_rate=cfg.MODEL.ATT_DROP_RATE)
+                                                        attn_drop_rate=cfg.MODEL.ATT_DROP_RATE,
+                                                        cls_sep=cls_sep_flag,
+                                                        cls_gen_type=cls_gen_type,
+                                                        cls_mlp_ratio=cls_mlp_ratio
+                                                        )
         if cfg.MODEL.TRANSFORMER_TYPE == 'deit_small_patch16_224_TransReID':
             self.in_planes = 384
         if pretrain_choice == 'imagenet':
@@ -234,7 +243,13 @@ class build_transformer_local(nn.Module):
         else:
             view_num = 0
 
-        self.base = factory[cfg.MODEL.TRANSFORMER_TYPE](img_size=cfg.INPUT.SIZE_TRAIN, sie_xishu=cfg.MODEL.SIE_COE, local_feature=cfg.MODEL.JPM, camera=camera_num, view=view_num, stride_size=cfg.MODEL.STRIDE_SIZE, drop_path_rate=cfg.MODEL.DROP_PATH)
+        # ================== 【新增：安全获取配置】 ==================
+        cls_sep_flag = getattr(cfg.MODEL, 'CLS_SEP', False)
+        # ==========================================================
+        
+        self.base = factory[cfg.MODEL.TRANSFORMER_TYPE](img_size=cfg.INPUT.SIZE_TRAIN, sie_xishu=cfg.MODEL.SIE_COE, local_feature=cfg.MODEL.JPM, camera=camera_num, view=view_num, stride_size=cfg.MODEL.STRIDE_SIZE, drop_path_rate=cfg.MODEL.DROP_PATH,
+                                                        cls_sep=cls_sep_flag
+                                                        )
 
         if pretrain_choice == 'imagenet':
             self.base.load_param(model_path)
