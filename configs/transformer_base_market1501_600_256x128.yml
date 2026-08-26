@@ -13,6 +13,7 @@ MODEL:
   CLS_SEP: False
   CLS_GEN_TYPE: 'dynamic'
   CLS_MLP_RATIO: 4.0
+  USE_ROPE: True   # 控制是否使用 2D RoPE
   # ======================
 
 INPUT:

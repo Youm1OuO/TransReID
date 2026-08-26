@@ -70,6 +70,7 @@ _C.MODEL.SIE_VIEW = False
 _C.MODEL.CLS_SEP = False
 _C.MODEL.CLS_GEN_TYPE = 'dynamic'
 _C.MODEL.CLS_MLP_RATIO = 4.0
+_C.MODEL.USE_ROPE = True   # 控制是否使用 2D RoPE
 
 # -----------------------------------------------------------------------------
 # INPUT

@@ -291,8 +291,7 @@ class PatchEmbed_overlap(nn.Module):
 
 
 class TransReID(nn.Module):
-    """ Transformer-based Object Re-Identification
-    """
+    """ Transformer-based Object Re-Identification"""
     def __init__(self, img_size=224, patch_size=16, stride_size=16, in_chans=3, num_classes=1000, embed_dim=768, depth=12,
                  num_heads=12, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0., camera=0, view=0,
                  drop_path_rate=0., hybrid_backbone=None, norm_layer=nn.LayerNorm, local_feature=False, sie_xishu =1.0,
@@ -371,7 +370,12 @@ class TransReID(nn.Module):
                 )
                 # 输入：[B, N, C], 输出：[B, depth, C]
             
-            # 2. 最终的聚合器
+            # 2. 初始小队长归一化
+            self.cross_norm_cls = norm_layer(embed_dim)
+            # 为每一层的 Patch 建立独立的 LayerNorm
+            self.cross_norm_x_list = nn.ModuleList([norm_layer(embed_dim) for _ in range(depth)])
+            
+            # 3. 最终的聚合器
             self.cls_aggregator = Mlp(
                 in_features=depth, 
                 hidden_features=int(depth * cls_mlp_ratio),
@@ -410,9 +414,6 @@ class TransReID(nn.Module):
 
         # ================== 【新逻辑：CLS 解耦分离流】 ==================
         if getattr(self, 'cls_sep', False):
-            if self.local_feature:
-                raise NotImplementedError("目前 CLS 分离 (cls_sep=True) 不支持与 JPM 模块 (local_feature=True) 同时使用！请在 cfg 中设置 JPM: False")
-
             # 取出 pos_embed 中属于 patch 的部分（去掉第 0 个旧 cls 的位置编码）
             patch_pos_embed = self.pos_embed[:, 1:, :] 
             
@@ -430,35 +431,45 @@ class TransReID(nn.Module):
             # 1. 获取 12 层的初始小队长 (完美运用 Transpose 降低参数量)
             if self.cls_gen_type == 'static':
                 cls_queries = self.cls_queries.expand(B, -1, -1) 
+                cls_queries_norm = self.cross_norm_cls(cls_queries)
             elif self.cls_gen_type == 'dynamic':
                 x_trans = x.transpose(1, 2)   # [B, N, C] -> [B, C, N]
                 cls_queries = self.cls_generator(x_trans)   # Mlp(N -> depth): [B, C, N] -> [B, C, depth]
                 cls_queries = cls_queries.transpose(1, 2)   # [B, C, depth] -> [B, depth, C]
-
+                cls_queries_norm = self.cross_norm_cls(cls_queries)
+                
             cls_outputs = []
             scale = self.embed_dim ** -0.5     # 无参交叉注意力的缩放因子
 
+            # 🌟 核心控制：如果是 JPM (local_feature=True), 只循环前 11 层！
+            loop_blocks = self.blocks[:-1] if self.local_feature else self.blocks
+            
             # 2. 逐层空间交互 + 手撕无参 Cross-Attention
-            for i, blk in enumerate(self.blocks):
+            for i, blk in enumerate(loop_blocks):
                 x = blk(x)   # Patch 内部完成一层的 Self-Attention + FFN
-                
-                cls_i = cls_queries[:, i:i+1, :]   # 取出当层的小队长 cls_i: [B, 1, C]
+                cls_i = cls_queries_norm[:, i:i+1, :]   # 取出当层的小队长 cls_i: [B, 1, C]
+                x_cross_norm = self.cross_norm_x_list[i](x)
                 # --- 向当层 Patch 索取信息 (Cross-Attention) ---
-                attn = (cls_i @ x.transpose(-2, -1)) * scale   # [B, 1, C] @ [B, C, N] -> [B, 1, N]
+                attn = (cls_i @ x_cross_norm.transpose(-2, -1)) * scale   # [B, 1, C] @ [B, C, N] -> [B, 1, N]
                 attn = attn.softmax(dim=-1)
-                updated_cls_i = attn @ x                       # [B, 1, N] @ [B, N, C] -> [B, 1, C]
+                updated_cls_i = attn @ x_cross_norm                       # [B, 1, N] @ [B, N, C] -> [B, 1, C]
                 # ---------------------------------------------
                 cls_outputs.append(updated_cls_i.squeeze(1))   # 存入列表, 形状为 [B, C]
             
-            x = self.norm(x)
-
-            # 3. 聚合小队长信息, 作为 global_feat 传给后续计算 Loss
-            stacked_cls = torch.stack(cls_outputs, dim=1)         # 堆叠 12 层: [B, depth, C]
-            stacked_cls_trans = stacked_cls.transpose(1, 2)       # [B, depth, C] -> [B, C, depth]
-            global_feat = self.cls_aggregator(stacked_cls_trans)  # Mlp(depth -> 1): [B, C, depth] -> [B, C, 1]
-            global_feat = global_feat.squeeze(-1)                 # [B, C, 1] -> [B, C]
-            
-            return global_feat
+            # 3. 分支返回逻辑
+            if self.local_feature:
+                # JPM 模式：不进行 self.norm, 直接吐出纯 Patch、前 11 层骨架、第 12 层 Query
+                stacked_cls_11 = torch.stack(cls_outputs, dim=1)   # [B, 11, 768]
+                query_12_norm = cls_queries_norm[:, -1:, :]             # 取出第 12 层的 Query: [B, 1, 768]
+                return x, stacked_cls_11, query_12_norm
+            else:
+                x = self.norm(x)
+                # 聚合小队长信息, 作为 global_feat 传给后续计算 Loss
+                stacked_cls = torch.stack(cls_outputs, dim=1)         # 堆叠 12 层: [B, depth, C]
+                stacked_cls_trans = stacked_cls.transpose(1, 2)       # [B, depth, C] -> [B, C, depth]
+                global_feat = self.cls_aggregator(stacked_cls_trans)  # Mlp(depth -> 1): [B, C, depth] -> [B, C, 1]
+                global_feat = global_feat.squeeze(-1)                 # [B, C, 1] -> [B, C]
+                return global_feat
 
         # 原版逻辑 (兼容旧版)
         else:

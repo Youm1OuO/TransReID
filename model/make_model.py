@@ -245,12 +245,35 @@ class build_transformer_local(nn.Module):
 
         # ================== 【新增：安全获取配置】 ==================
         cls_sep_flag = getattr(cfg.MODEL, 'CLS_SEP', False)
+        cls_gen_type = getattr(cfg.MODEL, 'CLS_GEN_TYPE', 'dynamic')
+        cls_mlp_ratio = getattr(cfg.MODEL, 'CLS_MLP_RATIO', 4.0)
         # ==========================================================
         
-        self.base = factory[cfg.MODEL.TRANSFORMER_TYPE](img_size=cfg.INPUT.SIZE_TRAIN, sie_xishu=cfg.MODEL.SIE_COE, local_feature=cfg.MODEL.JPM, camera=camera_num, view=view_num, stride_size=cfg.MODEL.STRIDE_SIZE, drop_path_rate=cfg.MODEL.DROP_PATH,
-                                                        cls_sep=cls_sep_flag
+        self.base = factory[cfg.MODEL.TRANSFORMER_TYPE](img_size=cfg.INPUT.SIZE_TRAIN, sie_xishu=cfg.MODEL.SIE_COE, local_feature=cfg.MODEL.JPM, 
+                                                        camera=camera_num, view=view_num, stride_size=cfg.MODEL.STRIDE_SIZE, drop_path_rate=cfg.MODEL.DROP_PATH,
+                                                        cls_sep=cls_sep_flag,
+                                                        cls_gen_type=cls_gen_type,
+                                                        cls_mlp_ratio=cls_mlp_ratio
                                                         )
 
+        # === 新增：为局部分支设立“共享聚合 MLP” ===
+        self.cls_sep = cls_sep_flag
+        if self.cls_sep:
+            depth = len(self.base.blocks)  # 固定为 12 层
+            hidden_dim = int(depth * cls_mlp_ratio)
+            # 这个文件中没有 MLP 类, 我们直接手写局部的cls聚合 MLP
+            self.local_aggregator = nn.Sequential(
+                nn.Linear(depth, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, 1)
+            )
+            self.scale = self.in_planes ** -0.5
+            
+            # 2. 初始小队长归一化
+            embed_dim=768
+            self.local_cross_norm_x = nn.LayerNorm(embed_dim)
+        # =================================================
+        
         if pretrain_choice == 'imagenet':
             self.base.load_param(model_path)
             print('Loading pretrained ImageNet model......from {}'.format(model_path))
@@ -321,41 +344,85 @@ class build_transformer_local(nn.Module):
         self.rearrange = rearrange
 
     def forward(self, x, label=None, cam_label= None, view_label=None):  # label is unused if self.cos_layer == 'no'
+        # ===============================================
+        if getattr(self, 'cls_sep', False):
+            # 解包主干传来的 3 个组件
+            features, cls_outputs_11, query_12_norm = self.base(x, cam_label=cam_label, view_label=view_label)
+            
+            # 1. 全局分支
+            b1_feat = self.b1(features)  # 执行第 12 层, 输出 [B, 196, 768]
+            b1_feat_norm = self.base.cross_norm_x_list[-1](b1_feat)
+            # 使用 query_12 收集全局特征
+            attn_g = (query_12_norm @ b1_feat_norm.transpose(-2, -1)) * self.scale   # [B, 1, C] @ [B, C, N] -> [B, 1, N] = [B, 1, 196]
+            cls_12_global = attn_g.softmax(dim=-1) @ b1_feat_norm    # [B, 1, N] @ [B, N, C] -> [B, 1, C] = [B, 1, 768]
+            
+            # 拼接 (11 + 1 = 12)，交由全局聚合器 (复用 base 里的 cls_aggregator)
+            global_stacked = torch.cat([cls_outputs_11, cls_12_global], dim=1).transpose(1, 2)  # [B, 768, 12]
+            global_feat = self.base.cls_aggregator(global_stacked).squeeze(-1)  # [B, 768]
 
-        features = self.base(x, cam_label=cam_label, view_label=view_label)
+            # 2. JPM 局部分支
+            if self.rearrange:
+                x_local = shuffle_unit(features, self.shift_num, self.shuffle_groups, begin=0)
+            else:
+                x_local = features
+            
+            patch_length = x_local.size(1) // self.divide_length
+            local_feats = []
+            
+            for i in range(4):
+                # 切片并执行第 12 层
+                b2_feat = self.b2(x_local[:, i*patch_length : (i+1)*patch_length])
+                b2_feat_norm = self.local_cross_norm_x(b2_feat)
+                
+                # 使用相同的 query_12 收集局部组特征
+                attn_l = (query_12_norm @ b2_feat_norm.transpose(-2, -1)) * self.scale
+                cls_12_local = attn_l.softmax(dim=-1) @ b2_feat_norm  # [B, 1, 768]
+                
+                # 拼接 (11 + 1 = 12)，交由【局部共享聚合器】
+                local_stacked = torch.cat([cls_outputs_11, cls_12_local], dim=1).transpose(1, 2) # [B, 768, 12]
+                local_feat = self.local_aggregator(local_stacked).squeeze(-1)  # [B, 768]
+                
+                local_feats.append(local_feat)
+                
+            local_feat_1, local_feat_2, local_feat_3, local_feat_4 = local_feats
 
-        # global branch
-        b1_feat = self.b1(features) # [64, 129, 768]
-        global_feat = b1_feat[:, 0]
-
-        # JPM branch
-        feature_length = features.size(1) - 1
-        patch_length = feature_length // self.divide_length
-        token = features[:, 0:1]
-
-        if self.rearrange:
-            x = shuffle_unit(features, self.shift_num, self.shuffle_groups)
         else:
-            x = features[:, 1:]
-        # lf_1
-        b1_local_feat = x[:, :patch_length]
-        b1_local_feat = self.b2(torch.cat((token, b1_local_feat), dim=1))
-        local_feat_1 = b1_local_feat[:, 0]
+            # 原版 JPM 逻辑 (保持不变)
+            features = self.base(x, cam_label=cam_label, view_label=view_label)
 
-        # lf_2
-        b2_local_feat = x[:, patch_length:patch_length*2]
-        b2_local_feat = self.b2(torch.cat((token, b2_local_feat), dim=1))
-        local_feat_2 = b2_local_feat[:, 0]
+            # global branch
+            b1_feat = self.b1(features) 
+            global_feat = b1_feat[:, 0]
 
-        # lf_3
-        b3_local_feat = x[:, patch_length*2:patch_length*3]
-        b3_local_feat = self.b2(torch.cat((token, b3_local_feat), dim=1))
-        local_feat_3 = b3_local_feat[:, 0]
+            feature_length = features.size(1) - 1
+            patch_length = feature_length // self.divide_length
+            token = features[:, 0:1]
 
-        # lf_4
-        b4_local_feat = x[:, patch_length*3:patch_length*4]
-        b4_local_feat = self.b2(torch.cat((token, b4_local_feat), dim=1))
-        local_feat_4 = b4_local_feat[:, 0]
+            if self.rearrange:
+                x = shuffle_unit(features, self.shift_num, self.shuffle_groups) # 默认 begin=1
+            else:
+                x = features[:, 1:]
+            
+            # lf_1
+            b1_local_feat = x[:, :patch_length]
+            b1_local_feat = self.b2(torch.cat((token, b1_local_feat), dim=1))
+            local_feat_1 = b1_local_feat[:, 0]
+
+            # lf_2
+            b2_local_feat = x[:, patch_length:patch_length*2]
+            b2_local_feat = self.b2(torch.cat((token, b2_local_feat), dim=1))
+            local_feat_2 = b2_local_feat[:, 0]
+
+            # lf_3
+            b3_local_feat = x[:, patch_length*2:patch_length*3]
+            b3_local_feat = self.b2(torch.cat((token, b3_local_feat), dim=1))
+            local_feat_3 = b3_local_feat[:, 0]
+
+            # lf_4
+            b4_local_feat = x[:, patch_length*3:patch_length*4]
+            b4_local_feat = self.b2(torch.cat((token, b4_local_feat), dim=1))
+            local_feat_4 = b4_local_feat[:, 0]
+        # ==============================================================
 
         feat = self.bottleneck(global_feat)
 
