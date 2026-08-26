@@ -114,7 +114,7 @@ def do_train(cfg,
                     logger.info("Validation Results - Epoch: {}".format(epoch))
                     logger.info("mAP: {:.1%}".format(mAP))
                     for r in [1, 5, 10]:
-                        logger.info("CMC curve, Rank-{:<3}:{:.1%}".format(r, cmc[r - 1]))
+                        logger.info("CMC curve, Rank-{:<3}:{:.16f}".format(r, cmc[r - 1]))
                     torch.cuda.empty_cache()
             else:
                 model.eval()
@@ -129,7 +129,7 @@ def do_train(cfg,
                 logger.info("Validation Results - Epoch: {}".format(epoch))
                 logger.info("mAP: {:.1%}".format(mAP))
                 for r in [1, 5, 10]:
-                    logger.info("CMC curve, Rank-{:<3}:{:.1%}".format(r, cmc[r - 1]))
+                    logger.info("CMC curve, Rank-{:<3}:{:.16f}".format(r, cmc[r - 1]))
                 torch.cuda.empty_cache()
 
 
@@ -167,7 +167,7 @@ def do_inference(cfg,
     logger.info("Validation Results ")
     logger.info("mAP: {:.1%}".format(mAP))
     for r in [1, 5, 10]:
-        logger.info("CMC curve, Rank-{:<3}:{:.1%}".format(r, cmc[r - 1]))
+        logger.info("CMC curve, Rank-{:<3}:{:.16f}".format(r, cmc[r - 1]))
     return cmc[0], cmc[4]
 
 
