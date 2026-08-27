@@ -73,6 +73,7 @@ _C.MODEL.CLS_SEP = False
 _C.MODEL.CLS_GEN_TYPE = 'dynamic'
 _C.MODEL.CLS_MLP_RATIO = 4.0
 _C.MODEL.USE_ROPE = True   # 控制是否使用 2D RoPE
+_C.MODEL.ABS_POS_MODE = 'cross_attn'   # 'none', 'normal', 'cross_attn' (绝对位置编码的模式)
 
 # -----------------------------------------------------------------------------
 # INPUT

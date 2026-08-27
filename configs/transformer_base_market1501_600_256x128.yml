@@ -19,6 +19,7 @@ MODEL:
   CLS_GEN_TYPE: 'dynamic'   # 'static' or 'dynamic'
   CLS_MLP_RATIO: 4.0
   USE_ROPE: True   # 控制是否使用 2D RoPE
+  ABS_POS_MODE: 'cross_attn'   # 'none', 'normal', 'cross_attn' (绝对位置编码的模式)
   # ======================
 
 INPUT:

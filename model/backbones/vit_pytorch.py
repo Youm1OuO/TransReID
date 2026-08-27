@@ -303,9 +303,12 @@ class TransReID(nn.Module):
     def __init__(self, img_size=224, patch_size=16, stride_size=16, in_chans=3, num_classes=1000, embed_dim=768, depth=12,
                  num_heads=12, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0., camera=0, view=0,
                  drop_path_rate=0., hybrid_backbone=None, norm_layer=nn.LayerNorm, local_feature=False, sie_xishu =1.0,
-                 cls_sep=False, cls_gen_type='dynamic', cls_mlp_ratio=4.0, use_rope=False):
+                 cls_sep=False, cls_gen_type='dynamic', cls_mlp_ratio=4.0, use_rope=False, abs_pos_mode='normal'):
         super().__init__()
+        # ==========================
         self.use_rope = use_rope
+        self.abs_pos_mode = abs_pos_mode
+        # ==========================
         self.num_classes = num_classes
         self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
         self.local_feature = local_feature
@@ -319,14 +322,19 @@ class TransReID(nn.Module):
 
         num_patches = self.patch_embed.num_patches
 
-        # ========== 预计算 2D RoPE ======================
+        # ========== 新增 ======================
+        # 预计算 2D RoPE 
         if self.use_rope:
             h_p, w_p = self.patch_embed.num_y, self.patch_embed.num_x
             cos, sin = generate_2d_rope(h_p, w_p, embed_dim // num_heads)
             self.register_buffer('rope_cos', cos)
             self.register_buffer('rope_sin', sin)
+            
+        # 只有当策略不是 'none' 时，才初始化 pos_embed
+        if self.abs_pos_mode != 'none':
+            self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
+            trunc_normal_(self.pos_embed, std=.02)
         # ===============================================
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
         self.cam_num = camera
         self.view_num = view
         self.sie_xishu = sie_xishu
@@ -364,7 +372,6 @@ class TransReID(nn.Module):
 
         # Classifier head
         self.fc = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
-        trunc_normal_(self.pos_embed, std=.02)
 
         self.apply(self._init_weights)
         # ================== 【新增：CLS 解耦分离模块】 ==================
@@ -423,10 +430,13 @@ class TransReID(nn.Module):
             nn.init.constant_(m.weight, 1.0)
 
     @torch.jit.ignore
-    def no_weight_decay(self):
-        if getattr(self, 'cls_sep', False):
-            return {'pos_embed'}
-        return {'pos_embed', 'cls_token'}
+    def no_weight_decay(self):  
+        no_decay = set()
+        if getattr(self, 'abs_pos_mode', 'normal') != 'none':
+            no_decay.add('pos_embed')
+        if not getattr(self, 'cls_sep', False):
+            no_decay.add('cls_token')
+        return no_decay
 
     def get_classifier(self):
         return self.head
@@ -448,7 +458,9 @@ class TransReID(nn.Module):
         # ================== 【新逻辑：CLS 解耦分离流】 ==================
         if getattr(self, 'cls_sep', False):
             # 取出 pos_embed 中属于 patch 的部分（去掉第 0 个旧 cls 的位置编码）
-            patch_pos_embed = self.pos_embed[:, 1:, :] 
+            use_normal_pos = (self.abs_pos_mode == 'normal')
+            patch_pos_embed = self.pos_embed[:, 1:, :] if use_normal_pos else 0
+            cross_pose = self.pos_embed[:, 1:, :] if self.abs_pos_mode == 'cross_attn' else None
             
             if self.cam_num > 0 and self.view_num > 0:
                 x = x + patch_pos_embed + self.sie_xishu * self.sie_embed[camera_id * self.view_num + view_id]
@@ -482,8 +494,11 @@ class TransReID(nn.Module):
                 x = blk(x, rope_cos, rope_sin)   # Patch 内部完成一层的 Self-Attention + FFN
                 cls_i = cls_queries_norm[:, i:i+1, :]   # 取出当层的小队长 cls_i: [B, 1, C]
                 x_cross_norm = self.cross_norm_x_list[i](x)
+                K = x_cross_norm
+                if cross_pose is not None:
+                    K = K + cross_pose
                 # --- 向当层 Patch 索取信息 (Cross-Attention) ---
-                attn = (cls_i @ x_cross_norm.transpose(-2, -1)) * scale   # [B, 1, C] @ [B, C, N] -> [B, 1, N]
+                attn = (cls_i @ K.transpose(-2, -1)) * scale   # [B, 1, C] @ [B, C, N] -> [B, 1, N]
                 attn = attn.softmax(dim=-1)
                 updated_cls_i = attn @ x_cross_norm                       # [B, 1, N] @ [B, N, C] -> [B, 1, C]
                 # ---------------------------------------------
@@ -508,15 +523,16 @@ class TransReID(nn.Module):
         else:
             cls_tokens = self.cls_token.expand(B, -1, -1)  
             x = torch.cat((cls_tokens, x), dim=1)
-
+            pos_embed = self.pos_embed if self.abs_pos_mode == 'normal' else 0
+            
             if self.cam_num > 0 and self.view_num > 0:
-                x = x + self.pos_embed + self.sie_xishu * self.sie_embed[camera_id * self.view_num + view_id]
+                x = x + pos_embed + self.sie_xishu * self.sie_embed[camera_id * self.view_num + view_id]
             elif self.cam_num > 0:
-                x = x + self.pos_embed + self.sie_xishu * self.sie_embed[camera_id]
+                x = x + pos_embed + self.sie_xishu * self.sie_embed[camera_id]
             elif self.view_num > 0:
-                x = x + self.pos_embed + self.sie_xishu * self.sie_embed[view_id]
+                x = x + pos_embed + self.sie_xishu * self.sie_embed[view_id]
             else:
-                x = x + self.pos_embed
+                x = x + pos_embed
 
             x = self.pos_drop(x)
             # ===因为原版 x 第 0 维是 cls_token，它不进行旋转 (cos=1, sin=0)===
@@ -549,7 +565,11 @@ class TransReID(nn.Module):
         for k, v in param_dict.items():
             if 'head' in k or 'dist' in k:
                 continue
-            # === 新增：如果启用了分离模块, 拒收原生 cls_token 的权重 ===
+            # ============ 新增 =======================
+            # 如果不使用 pos_embed, 拒收原生 pos_embed 的权重
+            if getattr(self, 'abs_pos_mode', 'normal') == 'none' and 'pos_embed' in k:
+                continue
+            # 如果启用了分离模块, 拒收原生 cls_token 的权重
             if getattr(self, 'cls_sep', False) and 'cls_token' in k:
                 continue
             # =========================================================
@@ -588,29 +608,33 @@ def resize_pos_embed(posemb, posemb_new, hight, width):
 
 
 def vit_base_patch16_224_TransReID(img_size=(256, 128), stride_size=16, drop_rate=0.0, attn_drop_rate=0.0, drop_path_rate=0.1, camera=0, view=0,local_feature=False,sie_xishu=1.5, 
-                                   cls_sep=False, cls_gen_type='dynamic', cls_mlp_ratio=4.0, **kwargs):
+                                   cls_sep=False, cls_gen_type='dynamic', cls_mlp_ratio=4.0, abs_pos_mode='normal', **kwargs):
     model = TransReID(
         img_size=img_size, patch_size=16, stride_size=stride_size, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=True,\
         camera=camera, view=view, drop_path_rate=drop_path_rate, drop_rate=drop_rate, attn_drop_rate=attn_drop_rate,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), sie_xishu=sie_xishu, local_feature=local_feature, 
-        cls_sep=cls_sep, cls_gen_type=cls_gen_type, cls_mlp_ratio=cls_mlp_ratio, **kwargs)
+        cls_sep=cls_sep, cls_gen_type=cls_gen_type, cls_mlp_ratio=cls_mlp_ratio, abs_pos_mode=abs_pos_mode, **kwargs)
 
     return model
 
-def vit_small_patch16_224_TransReID(img_size=(256, 128), stride_size=16, drop_rate=0., attn_drop_rate=0.,drop_path_rate=0.1, camera=0, view=0, local_feature=False, sie_xishu=1.5, **kwargs):
+def vit_small_patch16_224_TransReID(img_size=(256, 128), stride_size=16, drop_rate=0., attn_drop_rate=0.,drop_path_rate=0.1, camera=0, view=0, local_feature=False, sie_xishu=1.5, 
+                                    cls_sep=False, cls_gen_type='dynamic', cls_mlp_ratio=4.0, abs_pos_mode='normal', **kwargs):
     kwargs.setdefault('qk_scale', 768 ** -0.5)
     model = TransReID(
         img_size=img_size, patch_size=16, stride_size=stride_size, embed_dim=768, depth=8, num_heads=8,  mlp_ratio=3., qkv_bias=False, drop_path_rate = drop_path_rate,\
         camera=camera, view=view,  drop_rate=drop_rate, attn_drop_rate=attn_drop_rate,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6),  sie_xishu=sie_xishu, local_feature=local_feature, **kwargs)
+        norm_layer=partial(nn.LayerNorm, eps=1e-6),  sie_xishu=sie_xishu, local_feature=local_feature, 
+        cls_sep=cls_sep, cls_gen_type=cls_gen_type, cls_mlp_ratio=cls_mlp_ratio, abs_pos_mode=abs_pos_mode, **kwargs)
 
     return model
 
-def deit_small_patch16_224_TransReID(img_size=(256, 128), stride_size=16, drop_path_rate=0.1, drop_rate=0.0, attn_drop_rate=0.0, camera=0, view=0, local_feature=False, sie_xishu=1.5, **kwargs):
+def deit_small_patch16_224_TransReID(img_size=(256, 128), stride_size=16, drop_path_rate=0.1, drop_rate=0.0, attn_drop_rate=0.0, camera=0, view=0, local_feature=False, sie_xishu=1.5, 
+                                     cls_sep=False, cls_gen_type='dynamic', cls_mlp_ratio=4.0, abs_pos_mode='normal', **kwargs):
     model = TransReID(
         img_size=img_size, patch_size=16, stride_size=stride_size, embed_dim=384, depth=12, num_heads=6, mlp_ratio=4, qkv_bias=True,
         drop_path_rate=drop_path_rate, drop_rate=drop_rate, attn_drop_rate=attn_drop_rate, camera=camera, view=view, sie_xishu=sie_xishu, local_feature=local_feature,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+        norm_layer=partial(nn.LayerNorm, eps=1e-6), 
+        cls_sep=cls_sep, cls_gen_type=cls_gen_type, cls_mlp_ratio=cls_mlp_ratio, abs_pos_mode=abs_pos_mode, **kwargs)
 
     return model
 

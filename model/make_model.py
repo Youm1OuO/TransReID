@@ -146,6 +146,7 @@ class build_transformer(nn.Module):
         cls_gen_type = getattr(cfg.MODEL, 'CLS_GEN_TYPE', 'dynamic')
         cls_mlp_ratio = getattr(cfg.MODEL, 'CLS_MLP_RATIO', 4.0)  
         use_rope_flag = getattr(cfg.MODEL, 'USE_ROPE', False)
+        abs_pos_mode_flag = getattr(cfg.MODEL, 'ABS_POS_MODE', 'normal')
         # ==========================================================
         self.base = factory[cfg.MODEL.TRANSFORMER_TYPE](img_size=cfg.INPUT.SIZE_TRAIN, sie_xishu=cfg.MODEL.SIE_COE,
                                                         camera=camera_num, view=view_num, stride_size=cfg.MODEL.STRIDE_SIZE, drop_path_rate=cfg.MODEL.DROP_PATH,
@@ -154,7 +155,8 @@ class build_transformer(nn.Module):
                                                         cls_sep=cls_sep_flag,
                                                         cls_gen_type=cls_gen_type,
                                                         cls_mlp_ratio=cls_mlp_ratio,
-                                                        use_rope=use_rope_flag
+                                                        use_rope=use_rope_flag,
+                                                        abs_pos_mode=abs_pos_mode_flag
                                                         )
         if cfg.MODEL.TRANSFORMER_TYPE == 'deit_small_patch16_224_TransReID':
             self.in_planes = 384
@@ -250,6 +252,7 @@ class build_transformer_local(nn.Module):
         cls_gen_type = getattr(cfg.MODEL, 'CLS_GEN_TYPE', 'dynamic')
         cls_mlp_ratio = getattr(cfg.MODEL, 'CLS_MLP_RATIO', 4.0)
         use_rope_flag = getattr(cfg.MODEL, 'USE_ROPE', False)
+        abs_pos_mode_flag = getattr(cfg.MODEL, 'ABS_POS_MODE', 'normal')
         # ==========================================================
         
         self.base = factory[cfg.MODEL.TRANSFORMER_TYPE](img_size=cfg.INPUT.SIZE_TRAIN, sie_xishu=cfg.MODEL.SIE_COE, local_feature=cfg.MODEL.JPM, 
@@ -257,7 +260,8 @@ class build_transformer_local(nn.Module):
                                                         cls_sep=cls_sep_flag,
                                                         cls_gen_type=cls_gen_type,
                                                         cls_mlp_ratio=cls_mlp_ratio,
-                                                        use_rope=use_rope_flag
+                                                        use_rope=use_rope_flag,
+                                                        abs_pos_mode=abs_pos_mode_flag
                                                         )
         
         if pretrain_choice == 'imagenet':
@@ -341,8 +345,13 @@ class build_transformer_local(nn.Module):
             # 1. 全局分支
             b1_feat = self.b1(features, r_cos, r_sin)  # 执行第 12 层, 输出 [B, 196, 768]
             b1_feat_norm = self.base.cross_norm_x_list[-1](b1_feat)
+            
+            K_global = b1_feat_norm
+            if getattr(self.base, 'abs_pos_mode', 'normal') == 'cross_attn':
+                K_global = K_global + self.base.pos_embed[:, 1:, :]
+                
             # 使用 query_12 收集全局特征
-            attn_g = (query_12_norm @ b1_feat_norm.transpose(-2, -1)) * self.scale   # [B, 1, C] @ [B, C, N] -> [B, 1, N] = [B, 1, 196]
+            attn_g = (query_12_norm @ K_global.transpose(-2, -1)) * self.scale   # [B, 1, C] @ [B, C, N] -> [B, 1, N] = [B, 1, 196]
             cls_12_global = attn_g.softmax(dim=-1) @ b1_feat_norm    # [B, 1, N] @ [B, N, C] -> [B, 1, C] = [B, 1, 768]
             
             # 拼接 (11 + 1 = 12)，交由全局聚合器 (复用 base 里的 cls_aggregator)
@@ -356,13 +365,20 @@ class build_transformer_local(nn.Module):
                 r_sin_shuf = r_sin.unsqueeze(0)
             else:
                 r_cos_shuf, r_sin_shuf = None, None
-                
+            
+            if getattr(self.base, 'abs_pos_mode', 'normal') == 'cross_attn':
+                pos_shuf = self.base.pos_embed[:, 1:, :] 
+            else:
+                pos_shuf = None  
+
             if self.rearrange:
                 x_local = shuffle_unit(features, self.shift_num, self.shuffle_groups, begin=0)
                 if r_cos is not None:
                     # 使用与 features 完全一致的参数打乱坐标！
                     r_cos_shuf = shuffle_unit(r_cos_shuf, self.shift_num, self.shuffle_groups, begin=0)
                     r_sin_shuf = shuffle_unit(r_sin_shuf, self.shift_num, self.shuffle_groups, begin=0)
+                if pos_shuf is not None:
+                    pos_shuf = shuffle_unit(pos_shuf, self.shift_num, self.shuffle_groups, begin=0)
             else:
                 x_local = features
             
@@ -381,8 +397,12 @@ class build_transformer_local(nn.Module):
                 b2_feat = self.b2(x_local[:, i*patch_length : (i+1)*patch_length], rc_i, rs_i)
                 b2_feat_norm = self.base.local_cross_norm_x(b2_feat)
                 
+                K_local = b2_feat_norm
+                if pos_shuf is not None:
+                    K_local = K_local + pos_shuf[:, i*patch_length : (i+1)*patch_length]
+
                 # 使用相同的 query_12 收集局部组特征
-                attn_l = (query_12_norm @ b2_feat_norm.transpose(-2, -1)) * self.scale
+                attn_l = (query_12_norm @ K_local.transpose(-2, -1)) * self.scale
                 cls_12_local = attn_l.softmax(dim=-1) @ b2_feat_norm  # [B, 1, 768]
                 
                 # 拼接 (11 + 1 = 12)，交由【局部共享聚合器】
