@@ -8,7 +8,12 @@ MODEL:
   NO_MARGIN: True
   DEVICE_ID: ('0')
   TRANSFORMER_TYPE: 'vit_base_patch16_224_TransReID'
+  # JPE 与 SIE 在 De-ReID 中都不使用, patch也不重叠, 是为了还原基础的 ViT_B
   STRIDE_SIZE: [16, 16]
+  JPM: False
+  SIE_CAMERA: False
+  SIE_VIEW: False
+  SIE_COE: 3.0   # 默认的 SIE 权重系数, 如果不用 SIE 这个值不起作用
   # ======= 新增 =========
   CLS_SEP: False
   CLS_GEN_TYPE: 'dynamic'   # 'static' or 'dynamic'
@@ -19,8 +24,8 @@ MODEL:
 INPUT:
   SIZE_TRAIN: [256, 128]
   SIZE_TEST: [256, 128]
-  PROB: 0.5 # random horizontal flip
-  RE_PROB: 0.5 # random erasing
+  PROB: 0.5  # random horizontal flip
+  RE_PROB: 0.5  # random erasing
   PADDING: 10
   PIXEL_MEAN: [0.5, 0.5, 0.5]
   PIXEL_STD: [0.5, 0.5, 0.5]
