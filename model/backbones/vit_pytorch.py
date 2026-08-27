@@ -319,7 +319,6 @@ class TransReID(nn.Module):
 
         num_patches = self.patch_embed.num_patches
 
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         # ========== 预计算 2D RoPE ======================
         if self.use_rope:
             h_p, w_p = self.patch_embed.num_y, self.patch_embed.num_x
@@ -365,7 +364,6 @@ class TransReID(nn.Module):
 
         # Classifier head
         self.fc = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
-        trunc_normal_(self.cls_token, std=.02)
         trunc_normal_(self.pos_embed, std=.02)
 
         self.apply(self._init_weights)
@@ -377,6 +375,7 @@ class TransReID(nn.Module):
             # 1. 初始小队长生成器
             if self.cls_gen_type == 'static':
                 self.cls_queries = nn.Parameter(torch.randn(1, depth, embed_dim))   # 即 [1, 12, 768]
+                trunc_normal_(self.cls_queries, std=.02)
             elif self.cls_gen_type == 'dynamic':
                 # 直接复用上面现成的 Mlp 类
                 self.cls_generator = Mlp(
@@ -398,8 +397,20 @@ class TransReID(nn.Module):
                 out_features=1
             )
             # 输入：[B, 12, C], 输出：[B, 1, C]
-            
+        
+            # 专供 JPM 局部分支使用的聚合器和 LN
+            if self.local_feature:
+                self.local_cls_aggregator = Mlp(
+                    in_features=depth, 
+                    hidden_features=int(depth * cls_mlp_ratio),
+                    out_features=1
+                )
+                # 输入：[B, 12, C], 输出：[B, 1, C]
+                self.local_cross_norm_x = norm_layer(embed_dim)
             print(f"====> Enabled CLS Separation! Generator type: {self.cls_gen_type} <====")
+        else:
+            self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+            trunc_normal_(self.cls_token, std=.02)
         # ====================================================================
 
     def _init_weights(self, m):
@@ -413,6 +424,8 @@ class TransReID(nn.Module):
 
     @torch.jit.ignore
     def no_weight_decay(self):
+        if getattr(self, 'cls_sep', False):
+            return {'pos_embed'}
         return {'pos_embed', 'cls_token'}
 
     def get_classifier(self):
@@ -536,6 +549,10 @@ class TransReID(nn.Module):
         for k, v in param_dict.items():
             if 'head' in k or 'dist' in k:
                 continue
+            # === 新增：如果启用了分离模块, 拒收原生 cls_token 的权重 ===
+            if getattr(self, 'cls_sep', False) and 'cls_token' in k:
+                continue
+            # =========================================================
             if 'patch_embed.proj.weight' in k and len(v.shape) < 4:
                 # For old models that I trained prior to conv based patchification
                 O, I, H, W = self.patch_embed.proj.weight.shape

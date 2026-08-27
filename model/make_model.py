@@ -259,24 +259,6 @@ class build_transformer_local(nn.Module):
                                                         cls_mlp_ratio=cls_mlp_ratio,
                                                         use_rope=use_rope_flag
                                                         )
-
-        # === 新增：为局部分支设立“共享聚合 MLP” ===
-        self.cls_sep = cls_sep_flag
-        if self.cls_sep:
-            depth = len(self.base.blocks)  # 固定为 12 层
-            hidden_dim = int(depth * cls_mlp_ratio)
-            # 这个文件中没有 MLP 类, 我们直接手写局部的cls聚合 MLP
-            self.local_aggregator = nn.Sequential(
-                nn.Linear(depth, hidden_dim),
-                nn.GELU(),
-                nn.Linear(hidden_dim, 1)
-            )
-            self.scale = self.in_planes ** -0.5
-            
-            # 2. 初始小队长归一化
-            embed_dim=768
-            self.local_cross_norm_x = nn.LayerNorm(embed_dim)
-        # =================================================
         
         if pretrain_choice == 'imagenet':
             self.base.load_param(model_path)
@@ -397,7 +379,7 @@ class build_transformer_local(nn.Module):
 
                 # 切片并执行第 12 层
                 b2_feat = self.b2(x_local[:, i*patch_length : (i+1)*patch_length], rc_i, rs_i)
-                b2_feat_norm = self.local_cross_norm_x(b2_feat)
+                b2_feat_norm = self.base.local_cross_norm_x(b2_feat)
                 
                 # 使用相同的 query_12 收集局部组特征
                 attn_l = (query_12_norm @ b2_feat_norm.transpose(-2, -1)) * self.scale
@@ -405,7 +387,7 @@ class build_transformer_local(nn.Module):
                 
                 # 拼接 (11 + 1 = 12)，交由【局部共享聚合器】
                 local_stacked = torch.cat([cls_outputs_11, cls_12_local], dim=1).transpose(1, 2) # [B, 768, 12]
-                local_feat = self.local_aggregator(local_stacked).squeeze(-1)  # [B, 768]
+                local_feat = self.base.local_cls_aggregator(local_stacked).squeeze(-1)  # [B, 768]
                 
                 local_feats.append(local_feat)
                 
