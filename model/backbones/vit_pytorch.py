@@ -381,8 +381,7 @@ class TransReID(nn.Module):
         if self.cls_sep:
             # 1. 初始小队长生成器
             if self.cls_gen_type == 'static':
-                self.cls_queries = nn.Parameter(torch.randn(1, depth, embed_dim))   # 即 [1, 12, 768]
-                trunc_normal_(self.cls_queries, std=.02)
+                self.cls_queries = nn.Parameter(torch.zeros(1, depth, embed_dim))  # 即 [1, 12, 768]
             elif self.cls_gen_type == 'dynamic':
                 # 直接复用上面现成的 Mlp 类
                 self.cls_generator = Mlp(
@@ -571,6 +570,17 @@ class TransReID(nn.Module):
                 continue
             # 如果启用了分离模块, 拒收原生 cls_token 的权重
             if getattr(self, 'cls_sep', False) and 'cls_token' in k:
+                if getattr(self, 'cls_gen_type', 'dynamic') == 'static':
+                    # v 的形状是 [1, 1, 768], self.cls_queries 的形状是 [1, depth, 768]
+                    depth = self.cls_queries.shape[1]
+                    # 沿着 seq_len (depth) 维度复制权重
+                    v_cloned = v.expand(1, depth, -1) 
+                    try:
+                        self.state_dict()['cls_queries'].copy_(v_cloned)
+                        print(f"Successfully loaded and expanded pretrained cls_token to static cls_queries (depth: {depth})")
+                    except Exception as e:
+                        print(f"Error loading cls_queries: {e}")
+                # 无论是 static (已手动加载) 还是 dynamic (无法加载), 都跳过常规的装载步骤
                 continue
             # =========================================================
             if 'patch_embed.proj.weight' in k and len(v.shape) < 4:

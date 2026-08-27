@@ -7,6 +7,8 @@ from utils.meter import AverageMeter
 from utils.metrics import R1_mAP_eval
 from torch.cuda import amp
 import torch.distributed as dist
+from utils.tracker import MetricTracker
+
 
 def do_train(cfg,
              model,
@@ -39,6 +41,12 @@ def do_train(cfg,
 
     evaluator = R1_mAP_eval(num_query, max_rank=50, feat_norm=cfg.TEST.FEAT_NORM)
     scaler = amp.GradScaler()
+    
+    # === 新增：仅在主进程中实例化追踪器 ===
+    if not cfg.MODEL.DIST_TRAIN or dist.get_rank() == 0:
+        tracker = MetricTracker(cfg.OUTPUT_DIR, cfg.MODEL.NAME)
+    # ==================================
+
     # train
     for epoch in range(1, epochs + 1):
         start_time = time.time()
@@ -115,6 +123,9 @@ def do_train(cfg,
                     logger.info("mAP: {:.1%}".format(mAP))
                     for r in [1, 5, 10]:
                         logger.info("CMC curve, Rank-{:<3}:{:.16f}".format(r, cmc[r - 1]))
+                    # === 新增：传入当前指标，自动判断并保存模型 ===
+                    tracker.update(epoch, mAP, cmc[0], model)
+                    # ==========================================
                     torch.cuda.empty_cache()
             else:
                 model.eval()
@@ -130,8 +141,14 @@ def do_train(cfg,
                 logger.info("mAP: {:.1%}".format(mAP))
                 for r in [1, 5, 10]:
                     logger.info("CMC curve, Rank-{:<3}:{:.16f}".format(r, cmc[r - 1]))
+                # === 新增：传入当前指标，自动判断并保存模型 ===
+                tracker.update(epoch, mAP, cmc[0], model)
+                # ==========================================
                 torch.cuda.empty_cache()
-
+    # === 新增：训练循环结束后画图 ===
+    if not cfg.MODEL.DIST_TRAIN or dist.get_rank() == 0:
+        tracker.plot()
+    # ============================
 
 def do_inference(cfg,
                  model,

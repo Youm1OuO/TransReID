@@ -15,7 +15,9 @@ python train.py --config_file ${CONFIG_FILE} \
     MODEL.USE_ROPE 'True' \
     MODEL.ABS_POS_MODE 'cross_attn' \
     SOLVER.OPTIMIZER_NAME 'SGD' \
-    OUTPUT_DIR "./logs/Market_1501/Day1/e5_CLS_SEP=[True+dynamic+4.0]_USE_ROPE=[True]_ABS_POS_MODE=[cross_attn]"
+    SOLVER.MAX_EPOCHS '300' \
+    SOLVER.EVAL_PERIOD '20' \
+    OUTPUT_DIR "./logs/Market_1501/Day1/e6_300epoch_CLS_SEP=[True+dynamic+4.0]_USE_ROPE=[True]_ABS_POS_MODE=[cross_attn]"
 sleep 5
 
 
