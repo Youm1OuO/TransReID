@@ -326,7 +326,7 @@ class TransReID(nn.Module):
             self.register_buffer('rope_cos', cos)
             self.register_buffer('rope_sin', sin)
         # ===============================================
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
+        # self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
         self.cam_num = camera
         self.view_num = view
         self.sie_xishu = sie_xishu
@@ -364,7 +364,7 @@ class TransReID(nn.Module):
 
         # Classifier head
         self.fc = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
-        trunc_normal_(self.pos_embed, std=.02)
+        # trunc_normal_(self.pos_embed, std=.02)
 
         self.apply(self._init_weights)
         # ================== 【新增：CLS 解耦分离模块】 ==================
@@ -425,8 +425,8 @@ class TransReID(nn.Module):
     @torch.jit.ignore
     def no_weight_decay(self):
         if getattr(self, 'cls_sep', False):
-            return {'pos_embed'}
-        return {'pos_embed', 'cls_token'}
+            return set()  # 分离模式下，既没有 cls_token 也没有 pos_embed
+        return {'cls_token'}
 
     def get_classifier(self):
         return self.head
@@ -447,17 +447,14 @@ class TransReID(nn.Module):
 
         # ================== 【新逻辑：CLS 解耦分离流】 ==================
         if getattr(self, 'cls_sep', False):
-            # 取出 pos_embed 中属于 patch 的部分（去掉第 0 个旧 cls 的位置编码）
-            patch_pos_embed = self.pos_embed[:, 1:, :] 
-            
             if self.cam_num > 0 and self.view_num > 0:
-                x = x + patch_pos_embed + self.sie_xishu * self.sie_embed[camera_id * self.view_num + view_id]
+                x = x + self.sie_xishu * self.sie_embed[camera_id * self.view_num + view_id]
             elif self.cam_num > 0:
-                x = x + patch_pos_embed + self.sie_xishu * self.sie_embed[camera_id]
+                x = x + self.sie_xishu * self.sie_embed[camera_id]
             elif self.view_num > 0:
-                x = x + patch_pos_embed + self.sie_xishu * self.sie_embed[view_id]
+                x = x + self.sie_xishu * self.sie_embed[view_id]
             else:
-                x = x + patch_pos_embed
+                x = x
 
             x = self.pos_drop(x)
 
@@ -510,13 +507,13 @@ class TransReID(nn.Module):
             x = torch.cat((cls_tokens, x), dim=1)
 
             if self.cam_num > 0 and self.view_num > 0:
-                x = x + self.pos_embed + self.sie_xishu * self.sie_embed[camera_id * self.view_num + view_id]
+                x = x + self.sie_xishu * self.sie_embed[camera_id * self.view_num + view_id]
             elif self.cam_num > 0:
-                x = x + self.pos_embed + self.sie_xishu * self.sie_embed[camera_id]
+                x = x + self.sie_xishu * self.sie_embed[camera_id]
             elif self.view_num > 0:
-                x = x + self.pos_embed + self.sie_xishu * self.sie_embed[view_id]
+                x = x + self.sie_xishu * self.sie_embed[view_id]
             else:
-                x = x + self.pos_embed
+                x = x
 
             x = self.pos_drop(x)
             # ===因为原版 x 第 0 维是 cls_token，它不进行旋转 (cos=1, sin=0)===
@@ -549,10 +546,14 @@ class TransReID(nn.Module):
         for k, v in param_dict.items():
             if 'head' in k or 'dist' in k:
                 continue
-            # === 新增：如果启用了分离模块, 拒收原生 cls_token 的权重 ===
+            # ========= 新增 =======================
+            # 如果启用了分离模块, 拒收原生 cls_token 的权重
             if getattr(self, 'cls_sep', False) and 'cls_token' in k:
                 continue
-            # =========================================================
+            # 拒收所有绝对位置编码权重
+            if 'pos_embed' in k:
+                continue
+            # ======================================
             if 'patch_embed.proj.weight' in k and len(v.shape) < 4:
                 # For old models that I trained prior to conv based patchification
                 O, I, H, W = self.patch_embed.proj.weight.shape

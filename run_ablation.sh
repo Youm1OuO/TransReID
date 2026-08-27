@@ -5,24 +5,16 @@ CONFIG_FILE="/home/muyou/Projects/references/TransReID/configs/transformer_base_
 
 
 python train.py --config_file ${CONFIG_FILE} \
+    MODEL.JPM 'False' \
+    MODEL.SIE_CAMERA 'False' \
+    MODEL.SIE_VIEW 'False' \
     MODEL.CLS_SEP 'True' \
     MODEL.CLS_GEN_TYPE 'dynamic' \
     MODEL.CLS_MLP_RATIO '4.0' \
     MODEL.USE_ROPE 'True' \
     SOLVER.OPTIMIZER_NAME 'SGD' \
-    OUTPUT_DIR "./logs/Market_1501/Day1/e3_CLS_SEP=[True+dynamic+4.0]_USE_ROPE=[True]"
+    OUTPUT_DIR "./logs/Market_1501/Day1/e4_CLS_SEP=[True+dynamic+4.0]_USE_ROPE=[True]_without_abs_pos_embedding"
 sleep 5
-
-
-python train.py --config_file ${CONFIG_FILE} \
-    MODEL.CLS_SEP 'True' \
-    MODEL.CLS_GEN_TYPE 'static' \
-    MODEL.CLS_MLP_RATIO '4.0' \
-    MODEL.USE_ROPE 'True' \
-    SOLVER.OPTIMIZER_NAME 'SGD' \
-    OUTPUT_DIR "./logs/Market_1501/Day1/e4_CLS_SEP=[True+static+4.0]_USE_ROPE=[True]"
-sleep 5
-
 
 
 
